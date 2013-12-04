@@ -1,0 +1,336 @@
+#!/usr/bin/env python
+from __future__ import print_function
+# Copyright (c) 2013 Robin H. Johnson <robbat2@gentoo.org>
+# License: AGPLv3
+import fnmatch
+import logging
+import optparse
+import os
+import subprocess
+import sys
+import time
+import gzip
+from fastimport import commands
+
+USAGE = """
+dokuwiki2git-fast-import converts dokuwiki data directory into a git
+fast-import stream. The tream contains the wiki pages and media, with proper
+history.
+
+$ dokuwiki2git-fast-import [options] /path/to/dokuwiki/data"""
+
+DOKU_CHANGE_TYPE_CREATE = 'C'
+DOKU_CHANGE_TYPE_EDIT = 'E'
+DOKU_CHANGE_TYPE_MINOR_EDIT = 'e'
+DOKU_CHANGE_TYPE_DELETE = 'D'
+DOKU_CHANGE_TYPE_REVERT = 'R'
+
+CONVERT_PAGES = 50000
+CONVERT_MEDIA = 60000
+
+DIRPREFIX = 'wiki'
+
+SUPPORTED_CHANGES = (DOKU_CHANGE_TYPE_CREATE, DOKU_CHANGE_TYPE_EDIT, DOKU_CHANGE_TYPE_MINOR_EDIT, DOKU_CHANGE_TYPE_DELETE, DOKU_CHANGE_TYPE_REVERT)
+EMAIL = 'do-not-reply@wiki.sitka.bclibraries.ca'
+MISSING_FILE_MSG = "missing-file:%s"
+DEFAULT_COMMIT_USER = 'dokuwiki2git'
+
+logging.basicConfig(level = logging.DEBUG, format = '%(levelname)s - %(message)s')
+log = logging.getLogger()
+
+# Extend the fastimport system
+class FileModifyCommandPath(commands.FileModifyCommand):
+  def __init__(self, path, mode, dataref, data, datapath):
+    assert len([x for x in [dataref, data, datapath] if x is not None]) == 1 # exactly one of dataref, data, path must be non-None
+    if path is not None:
+      with open(datapath, 'rb') as f:
+        data = f.read()
+    super(FileModifyCommandPath, self).__init__(path, mode, dataref, data)
+
+class FileModifyCommandGZPath(commands.FileModifyCommand):
+  def __init__(self, path, mode, dataref, data, datapath):
+    assert len([x for x in [dataref, data, datapath] if x is not None]) == 1 # exactly one of dataref, data, path must be non-None
+    if datapath is not None:
+      #with gzip.open(datapath, 'rb') as f:
+      #  data = f.read()
+      try:
+        f = gzip.open(datapath, 'rb')
+        data = f.read()
+        f.close()
+      except:
+        data = 'Unable to read %s' % (datapath, )
+
+    super(FileModifyCommandGZPath, self).__init__(path, mode, dataref, data)
+
+class DoneCommand(commands.ImportCommand):
+    def __init__(self):
+        super(DoneCommand,self).__init__('done')
+    def __repr__(self):
+        return "done"
+
+# Now our conversion system
+class Converter:
+  def __init__(self):
+    self.datadir = None
+    self.atticdir_media = None
+    self.atticdir_pages = None
+    self.metadir_media = None
+    self.metadir_pages = None
+    self.objdir_media = None
+    self.objdir_pages = None
+    self.changelog = [] # (timestamp, ip, changetype, pagename, author, comment)
+    self.stream = [] # fast-import stream, join with '\n'
+    self.gitfile = 'git-fast-export'
+  
+  def run(self, params):
+    parser = optparse.OptionParser(usage = USAGE)
+    parser.add_option('-o', '--output', dest='output', help=('Create git directory at outputdir. Default is "%s"' % (self.gitfile)), default = self.gitfile)
+    parser.add_option('-q', '--quiet', action='store_const', const=0, dest='verbose', help='Show only warnings and errors')
+    parser.add_option('-v', '--verbose', action='store_const', const=2, dest='verbose', help='Show debug messages', default=1)
+    (options, args) = parser.parse_args(params)
+    level = logging.WARN
+    if options.verbose:
+      level = (logging.WARN, logging.INFO, logging.DEBUG)[options.verbose]
+    log.setLevel(level)
+    self.gitfile = options.output
+    if len(args) == 0:
+      parser.print_help()
+      log.error('Dokuwiki data directory is a required argument')
+      sys.exit(1)
+    time_start = time.time()
+    self.set_datadir(args[0])
+    self.read_data()
+    log.info('%d commits queued' % len(self.stream))
+    self.write_stream()
+    #self.create_git_repository()
+    time_end = time.time()
+    time_took = time_end - time_start
+    log.info('Finished converting dokuwiki data dir "%s" into a git export "%s", took %.2f seconds' % (self.datadir, self.gitfile, time_took))
+
+  def write_stream(self):
+    outf = open(self.gitfile, 'wb',0)
+    for c in self.stream:
+      print(repr(c),file=outf)
+    outf.close()
+
+  def set_datadir(self, datadir):
+    if not os.path.isfile(os.path.join(datadir, '_dummy')):
+      raise RuntimeError('Directory "%s" does not look like a dokuwiki datadir' % datadir)
+    self.datadir = datadir
+    self.atticdir_media = os.path.join(datadir, 'media_attic')
+    self.atticdir_pages = os.path.join(datadir, 'attic')
+    self.metadir_media = os.path.join(datadir, 'media_meta')
+    self.metadir_pages = os.path.join(datadir, 'meta')
+    self.objdir_media = os.path.join(datadir, 'media')
+    self.objdir_pages = os.path.join(datadir, 'pages')
+    log.info('Using datadir: %s' % self.datadir)
+
+  def read_data(self):
+    #self.commands.append('git init --quiet')
+    # go through data/meta
+    self.read_pages_meta()
+    self.read_media_meta()
+    # sort history
+    self.changelog.sort()
+    # go through data/attic, importing pages referenced by .changes in meta
+    #self.read_attic()
+    #self.read_media()
+    #self.commands.append('git commit --quiet --allow-empty --author="dokuwiki2git <dokuwiki2git@hoxu.github.com>" -m "Dokuwiki data imported by dokuwiki2git"')
+    self.emit_fast()
+
+  def read_pages_meta(self):
+    log.info('Reading meta (pages)')
+    pages = 0
+    mydir = self.metadir_pages
+    len1 = len(self.changelog)
+    for path, dirs, files in os.walk(mydir):
+      for f in files:
+        if fnmatch.fnmatch(f, '*.changes'):
+          relpath = os.path.relpath(os.path.join(path, f), mydir)
+          pagepath = relpath.rsplit('.', 1)[0]
+          self.read_changes(pagepath, os.path.join(path, f), CONVERT_PAGES)
+          pages += 1
+    len2 = len(self.changelog)
+    log.info('%d changelog entries for %d pages found' % (len2-len1, pages))
+  
+  def read_media_meta(self):
+    log.info('Reading meta (media)')
+    pages = 0
+    mydir = self.metadir_media
+    len1 = len(self.changelog)
+    for path, dirs, files in os.walk(mydir):
+      for f in files:
+        if fnmatch.fnmatch(f, '*.changes'):
+          relpath = os.path.relpath(os.path.join(path, f), mydir)
+          pagepath = relpath.rsplit('.', 1)[0]
+          #log.debug("relpath=%s pagepath=%s" % (relpath, pagepath))
+          self.read_changes(pagepath, os.path.join(path, f), CONVERT_MEDIA)
+          pages += 1
+    len2 = len(self.changelog)
+    log.info('%d changelog entries for %d media objects found' % (len2-len1, pages))
+
+  def read_changes(self, pagepath, fullpath, objtype):
+    if pagepath in ('_dokuwiki', '_comments', '_media'):
+      return
+    pagename = pagepath.replace('/', ':')
+    log.debug('Reading meta for %s "%s"' % ('page' if objtype == CONVERT_PAGES else 'media', pagename,))
+    with open(fullpath, 'rb') as f:
+      linecount = 0
+      for line in f:
+        linecount += 1
+      f.seek(0L)
+      lineno = 0
+      for line in f:
+        changeparts = line.split('\t')
+        #log.debug(changeparts)
+        assert(len(changeparts) == 7)
+        assert(changeparts[3] == pagename)
+        assert(changeparts[2] in SUPPORTED_CHANGES)
+        changeparts.append({
+          'objtype': objtype,
+          'changefile': fullpath,
+          'lineno': lineno,
+          'lastline': lineno >= linecount-1,
+        })
+        #log.debug(changeparts)
+        self.changelog.append(changeparts)
+        lineno += 1
+
+  def emit_fast(self):
+    cmd = commands.FeatureCommand('done')
+    self.stream.append(cmd)
+    branch = "refs/heads/master"
+    cmd = commands.ResetCommand(branch, None)
+    self.stream.append(cmd)
+    for c in self.changelog:
+      #message = pagepath + ': ' + c[5]
+      (timestamp, ip, changetype, page, user, message, extra, _convert) = c
+      objtype = _convert['objtype']
+      if len(extra.strip()) == 0:
+        extra = None
+      headers = {}
+
+      filename = page.replace(':', '/')
+      attic_filename = None
+      attic_dir = None
+      file_suffix = None
+      file_base = None
+      if objtype == CONVERT_PAGES:
+        file_suffix = '.txt'
+        file_base = 'pages'
+        attic_suffix = '.%s.txt.gz' % (c[0], )
+        attic_filename = filename + attic_suffix
+        attic_dir = self.atticdir_pages
+      elif objtype == CONVERT_MEDIA:
+        extpos = max(filename.rfind('.'), 0)
+        file_suffix = filename[extpos:]
+        file_base = 'media'
+        attic_suffix = '.%s%s' % (c[0], file_suffix)
+        attic_filename = filename[0:extpos] + attic_suffix
+        attic_dir = self.atticdir_media
+        file_suffix = ''
+      else:
+        assert False # Unknown conversion type
+
+      filepath = os.path.join(attic_dir, attic_filename)
+      realpath = os.path.join(file_base, filename + file_suffix)
+      #log.debug("realpath=%s -> filepath=%s" % (realpath, filepath, ))
+
+      f = None
+      if changetype in (DOKU_CHANGE_TYPE_CREATE, DOKU_CHANGE_TYPE_EDIT, DOKU_CHANGE_TYPE_MINOR_EDIT, DOKU_CHANGE_TYPE_REVERT):
+        if os.path.exists(filepath):
+          if objtype == CONVERT_PAGES:
+            f = FileModifyCommandGZPath(realpath, 0100644, None, None, filepath)
+          elif objtype == CONVERT_MEDIA:
+            f = FileModifyCommandPath(realpath, 0100644, None, None, filepath)
+          else:
+            assert False # Unknown objtype
+        
+        if f is None and objtype == CONVERT_MEDIA and _convert['lastline']:
+          filepath = os.path.join(self.datadir, realpath)
+          if os.path.exists(filepath):
+            f = FileModifyCommandPath(realpath, 0100644, None, None, filepath)
+	    headers['X-DokuWiki-Note'] = 'Imported %s to cover missing %s' % (realpath, attic_filename)
+        if f is None and objtype == CONVERT_PAGES and _convert['lastline']:
+          filepath = os.path.join(self.datadir, realpath)
+          if os.path.exists(filepath):
+            f = FileModifyCommandPath(realpath, 0100644, None, None, filepath)
+	    headers['X-DokuWiki-Note'] = 'Imported %s to cover missing %s' % (realpath, attic_filename)
+          
+        if f is None:
+          log.warn("%s missing from attic (changetype=%s)" % (attic_filename, changetype, ))
+          f = commands.FileModifyCommand(realpath, 0100644, None, MISSING_FILE_MSG % (attic_filename))
+          headers['X-DokuWiki-Missing-File'] = attic_filename
+      elif changetype in (DOKU_CHANGE_TYPE_DELETE):
+          f = commands.FileDeleteCommand(realpath)
+
+      file_cmds = [f]
+
+      if len(message) == 0:
+        message = 'Empty changelog entry'
+      if changetype == DOKU_CHANGE_TYPE_REVERT:
+        headers['X-DokuWiki-Revert-Timestamp'] = extra
+        extra = None
+      if extra is not None:
+        headers['X-DokuWiki-Extra']  = extra
+
+      message = message.strip()
+      headers.update({
+        'X-DokuWiki-IP': ip,
+        'X-DokuWiki-User': user,
+        'X-DokuWiki-Changetype':  changetype,
+        'X-DokuWiki-Page-File':  filename,
+        'X-DokuWiki-Attic-File':  attic_filename,
+      })
+      message = [message,'']
+      message += map(lambda (k,v): '%s: %s' % (k, v), headers.items())
+      message = "\n".join(message)
+
+      if len(user) == 0:
+        user = DEFAULT_COMMIT_USER
+      # user tuple is (name, email, secs-since-epoch, secs-offset-from-utc)
+      committer = (user, EMAIL, int(timestamp), -8 * 3600)
+                                  #   ref, mark, author, commiter, msg,   from, merges, files
+      cmd = commands.CommitCommand(branch, None, None, committer, message, None, None, file_cmds)
+      self.stream.append(cmd)
+
+    # Sadly, the media meta changes does not include all files
+    # So we need to include all other media manually
+    committer = (DEFAULT_COMMIT_USER, EMAIL, time.time(), -8 * 3600)
+    file_cmds = []
+    mydir = self.objdir_media
+    for path, dirs, files in os.walk(mydir):
+      for f in files:
+        relpath = os.path.relpath(os.path.join(path, f), self.datadir)
+        pagepath = relpath.rsplit('.', 1)[0]
+        fcmd = FileModifyCommandPath(relpath, 0100644, None, None, os.path.join(path, f))
+        file_cmds.append(fcmd)
+    message = '\n'.join(['Manual import of media objects','','X-DokuWiki-User: '+DEFAULT_COMMIT_USER])
+    cmd = commands.CommitCommand(branch, None, None, committer, message, None, None, file_cmds)
+    self.stream.append(cmd)
+
+    # And we are going to do an import of all pages as well for good measure
+    file_cmds = []
+    mydir = self.objdir_pages
+    for path, dirs, files in os.walk(mydir):
+      for f in files:
+        relpath = os.path.relpath(os.path.join(path, f), self.datadir)
+        pagepath = relpath.rsplit('.', 1)[0]
+        fcmd = FileModifyCommandPath(relpath, 0100644, None, None, os.path.join(path, f))
+        file_cmds.append(fcmd)
+    message = '\n'.join(['Manual import of pages','','X-DokuWiki-User: '+DEFAULT_COMMIT_USER])
+    cmd = commands.CommitCommand(branch, None, None, committer, message, None, None, file_cmds)
+    self.stream.append(cmd)
+
+    # Done now
+    cmd = DoneCommand()
+    self.stream.append(cmd)
+
+if __name__ == '__main__':
+  c = Converter()
+  c.run(sys.argv[1:])
+
+#1368577752  76.10.190.11  C techadmin:robbat2_todo  rjohnson  created 
+#/var/www/wiki.sitka.bclibraries.ca/htdocs/data/attic/techadmin/robbat2_todo.1368577752.txt.gz
+
+# vim:ft=python ts=2 sts=2 et:

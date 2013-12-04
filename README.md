@@ -5,10 +5,19 @@ dokuwiki2git converts dokuwiki data directory into a git repository containing
 the wiki pages, with proper history. Thus, migration to git-backed wiki engines
 (eg. gollum) becomes easier.
 
+It contains two modes:
+
+* direct creation
+* git fast-import
+
 Usage
 -----
 
     $ dokuwiki2git /path/to/dokuwiki/data
+
+    $ dokuwiki2git-fast-import /path/to/dokuwiki/data >FILE
+    $ mkdir repo ; cd repo ; git init
+    $ git fast-import <FILE
 
 This will create a git repository in `gitdir/`, containing the whole history of
 the dokuwiki pages, one commit per change.
